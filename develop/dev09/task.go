@@ -22,7 +22,9 @@ import (
 Программа должна проходить все тесты. Код должен проходить проверки go vet и golint.
 */
 
+// сама функция wget
 func wget(site string, root string) error {
+	//создаем папку под названием сайта
 	site = strings.TrimRight(site, "\r\n")
 	siteURL, err := url.Parse(site)
 	hostname := strings.TrimPrefix(siteURL.Hostname(), "www.")
@@ -30,12 +32,14 @@ func wget(site string, root string) error {
 	if err != nil {
 		return err
 	}
+	//переходим в эту папку и ищем все ссылки на основной странице
 	err = os.Chdir(filepath.Join(root, hostname))
 	err = crawl(site, 2, site)
 
 	return err
 }
 
+// рекурсивная функция для поиска ссылок и файлов на странице
 func crawl(url string, depth int, baseURL string) error {
 	if depth <= 0 {
 		return nil
@@ -51,15 +55,24 @@ func crawl(url string, depth int, baseURL string) error {
 		return fmt.Errorf("Failed to fetch the page %s. Status code: %d", url, resp.StatusCode)
 	}
 
+	//проверяем, что ссылка не ведет на какой-то другой сайт и является сабдиректорией
+	if isSameOrSubdirectory(baseURL, url) {
+		err = downloadResources(resp.Body, baseURL)
+		if err != nil {
+			fmt.Println("Error downloading resources:", err)
+		}
+	}
+
+	//достаем все ссылки со страницы
 	links := extractLinks(downloadPage(url), baseURL)
 	for _, link := range links {
-		// Преобразование относительных URL в абсолютные
+		//преобразуем все ссылки в абсолютные ссылки
 		absoluteURL, err := makeAbsoluteURL(link, baseURL)
 		if err != nil {
 			fmt.Println("Error making absolute URL:", err)
 			continue
 		}
-
+		//продолжаем поиски ссылок на новых страницах
 		err = crawl(absoluteURL, depth-1, baseURL)
 		if err != nil {
 			fmt.Println("Error crawling:", err)
@@ -69,7 +82,85 @@ func crawl(url string, depth int, baseURL string) error {
 	return nil
 }
 
-// Пример простой функции для преобразования относительных URL в абсолютные
+// функция для скачивания сурсов
+func downloadResources(body io.Reader, baseURL string) error {
+	tokenizer := html.NewTokenizer(body)
+
+	for {
+		tt := tokenizer.Next()
+		switch tt {
+		case html.ErrorToken:
+			return nil
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			//обрабатываем теги, содержащие ресурсы, например, "img", "link", "script" и т.д.
+			switch token.Data {
+			case "img", "link", "script":
+				for _, attr := range token.Attr {
+					if attr.Key == "src" || attr.Key == "href" {
+						resourceURL, err := makeAbsoluteURL(attr.Val, baseURL)
+						if err != nil {
+							fmt.Println("Error making absolute URL:", err)
+							continue
+						}
+						err = downloadFile(resourceURL, baseURL)
+						if err != nil {
+							fmt.Println("Error downloading file:", err)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// скачиваем файлы по URL и сохранения в сабдиректории
+func downloadFile(url string, baseURL string) error {
+	if !isSameOrSubdirectory(baseURL, url) {
+		return nil
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Failed to fetch the resource. Status code: %d", resp.StatusCode)
+	}
+
+	//получаем имя файла
+	fileName := filepath.Base(url)
+	relPath, err := filepath.Rel(baseURL, url)
+	if err != nil {
+		return err
+	}
+	dirPath := filepath.Join(".", relPath)
+	dirPath = filepath.Dir(dirPath)
+
+	//создаем сабдиректорию, если ее нет
+	if err := os.MkdirAll(dirPath, os.ModeDir); err != nil {
+		return err
+	}
+
+	//создаем файл и сохраняем в нем данные
+	file, err := os.Create(filepath.Join(dirPath, fileName))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Downloaded:", url)
+	return nil
+}
+
+// преобразовываем URL в абсолютные
 func makeAbsoluteURL(relativeURL, baseURL string) (string, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
@@ -84,6 +175,7 @@ func makeAbsoluteURL(relativeURL, baseURL string) (string, error) {
 	return base.ResolveReference(rel).String(), nil
 }
 
+// ищем ссылки с помощью данной функции
 func extractLinks(body []byte, baseURL string) []string {
 	var links []string
 	bodyReader := bytes.NewReader(body)
@@ -99,7 +191,7 @@ func extractLinks(body []byte, baseURL string) []string {
 			if "a" == token.Data {
 				for _, attr := range token.Attr {
 					if attr.Key == "href" {
-						linkURL, err := resolveURL(attr.Val, baseURL)
+						linkURL, err := makeAbsoluteURL(attr.Val, baseURL)
 						if err == nil && isSameOrSubdirectory(baseURL, linkURL) {
 							links = append(links, linkURL)
 						}
@@ -110,25 +202,14 @@ func extractLinks(body []byte, baseURL string) []string {
 	}
 }
 
-func resolveURL(href, baseURL string) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-	rel, err := url.Parse(href)
-	if err != nil {
-		return "", err
-	}
-	absURL := base.ResolveReference(rel)
-	return absURL.String(), nil
-}
-
+// проверяем, что сабдиректория относится к нашему основному сайту
 func isSameOrSubdirectory(baseURL, linkURL string) bool {
 	base, _ := url.Parse(baseURL)
 	link, _ := url.Parse(linkURL)
 	return strings.HasPrefix(link.Host, base.Host)
 }
 
+// скачиваем страницу
 func downloadPage(url string) []byte {
 	resp, err := http.Get(url)
 	if err != nil {
